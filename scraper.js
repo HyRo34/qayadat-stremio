@@ -1,6 +1,7 @@
 const axios = require('axios');
 const cheerio = require('cheerio');
 const mapping = require('./mapping.json');
+const { getTorboxStream } = require('./torbox');
 
 const QAYADAT_BASE = 'https://play.qayadat.org';
 
@@ -10,10 +11,26 @@ const HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 };
 
+async function checkPixeldrainAvailable(url) {
+    try {
+        const res = await axios.head(url, {
+            timeout: 5000,
+            validateStatus: () => true
+        });
+        // Pixeldrain returns 509 when bandwidth exceeded
+        if (res.status === 509 || res.status === 429) {
+            console.log('Pixeldrain bandwidth exceeded, using TorBox fallback');
+            return false;
+        }
+        return true;
+    } catch (e) {
+        console.log('Pixeldrain check failed:', e.message);
+        return true; // Assume available if check fails
+    }
+}
+
 async function resolvePixeldrain(url) {
     try {
-        // Pixeldrain API /file/ID redirects to the CDN. Stremio handles redirects usually, 
-        // but resolving it explicitly can help with "loading forever" issues.
         const res = await axios.head(url, { maxRedirects: 0, validateStatus: s => s >= 200 && s < 400 });
         if (res.headers.location) {
             return res.headers.location;
@@ -55,7 +72,6 @@ async function getStream(type, id) {
         console.log(`Applied offset for Season ${season}: ${episode} -> Episode ${targetEpisode}`);
     }
 
-
     // Loop through pages (max 5) to find the episode
     let episodeUrl = null;
     let currentPage = 1;
@@ -78,24 +94,16 @@ async function getStream(type, id) {
                 const episodeRegex = new RegExp(`(?:episode|bolum)\\s*0*${targetEpisode}\\b`, 'i');
                 const seasonRegex = new RegExp(`(?:season|sezon)\\s*0*${season}\\b`, 'i');
 
-                // Priority 1: Match "Season X ... Episode Y" (Best case)
                 if (seasonRegex.test(text) && episodeRegex.test(text)) {
                     episodeUrl = href;
                     return false;
                 }
 
-                // Priority 2: Match "Episode Y" ONLY
-                // Strictness: If querying Season 1, or if using absolute numbering (offset applied), accept "Episode Y".
-                // If querying Season > 1 WITHOUT offset, we usually require Season match to avoid finding S1 E14 when looking for S3 E14.
-                // BUT if we applied an offset (e.g. looking for Ep 63), we can trust "Episode 63" because S1 doesn't go that high.
                 let strictMode = (season > 1 && !seasonOffsets);
 
                 if (episodeRegex.test(text)) {
                     if (!episodeUrl && !strictMode) {
                         episodeUrl = href;
-                    } else if (strictMode) {
-                        // We found "Episode 14" but we want S3. And no offset was provided.
-                        // Ignore S1's Episode 14.
                     }
                 }
             });
@@ -124,13 +132,10 @@ async function getStream(type, id) {
         const episodePage = await axios.get(episodeUrl, { headers: HEADERS });
         const $ep = cheerio.load(episodePage.data);
 
-        // 3. Extract Download Links (Pixeldrain)
         const streams = [];
+        const pixeldrainLinks = [];
 
-        // Use Promise.all to handle async resolution if we want parallelism, 
-        // but cheerio loop is sync. We gather promises then await.
-        const linkPromises = [];
-
+        // Collect all Pixeldrain links first
         $ep('a[href*="pixeldrain.com"]').each((i, el) => {
             const href = $ep(el).attr('href');
             const text = $ep(el).text().trim();
@@ -140,25 +145,54 @@ async function getStream(type, id) {
                 const fileId = match[1];
                 const cleanTitle = text.replace('Download', '').trim();
                 const rawUrl = `https://pixeldrain.com/api/file/${fileId}`;
+                pixeldrainLinks.push({ fileId, cleanTitle, rawUrl });
+            }
+        });
 
-                linkPromises.push(resolvePixeldrain(rawUrl).then(resolvedUrl => {
-                    return {
-                        title: `Qayadat Play\n${cleanTitle}`,
-                        url: resolvedUrl,
+        if (pixeldrainLinks.length === 0) {
+            console.log("No Pixeldrain links found on page.");
+            return [];
+        }
+
+        // Check if Pixeldrain is available (first link as sample)
+        const pixeldrainAvailable = await checkPixeldrainAvailable(pixeldrainLinks[0].rawUrl);
+
+        for (const link of pixeldrainLinks) {
+            if (pixeldrainAvailable) {
+                // Use Pixeldrain directly
+                const resolvedUrl = await resolvePixeldrain(link.rawUrl);
+                streams.push({
+                    title: `Qayadat Play\n${link.cleanTitle}`,
+                    url: resolvedUrl,
+                    behaviorHints: {
+                        notWebReady: true,
+                        bingeGroup: "qayadat"
+                    }
+                });
+            } else {
+                // Fallback to TorBox
+                const torboxUrl = await getTorboxStream(link.rawUrl);
+                if (torboxUrl) {
+                    streams.push({
+                        title: `Qayadat Play (TorBox)\n${link.cleanTitle}`,
+                        url: torboxUrl,
+                        behaviorHints: {
+                            notWebReady: true,
+                            bingeGroup: "qayadat-torbox"
+                        }
+                    });
+                } else {
+                    // TorBox failed, still add Pixeldrain as last resort
+                    streams.push({
+                        title: `Qayadat Play (Limited)\n${link.cleanTitle}`,
+                        url: link.rawUrl,
                         behaviorHints: {
                             notWebReady: true,
                             bingeGroup: "qayadat"
                         }
-                    };
-                }));
+                    });
+                }
             }
-        });
-
-        const resolvedStreams = await Promise.all(linkPromises);
-        streams.push(...resolvedStreams);
-
-        if (streams.length === 0) {
-            console.log("No streams found on page.");
         }
 
         return streams;
