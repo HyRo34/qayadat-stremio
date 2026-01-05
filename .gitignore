@@ -1,0 +1,6 @@
+node_modules/
+.env
+debug_log.txt
+debug_ua.txt
+*.html
+*.xml
