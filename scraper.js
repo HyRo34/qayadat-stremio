@@ -144,7 +144,11 @@ async function getStream(type, id) {
                 linkPromises.push(resolvePixeldrain(rawUrl).then(resolvedUrl => {
                     return {
                         title: `Qayadat Play\n${cleanTitle}`,
-                        url: resolvedUrl
+                        url: resolvedUrl,
+                        behaviorHints: {
+                            notWebReady: true,
+                            bingeGroup: "qayadat"
+                        }
                     };
                 }));
             }
