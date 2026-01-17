@@ -4,6 +4,7 @@ const mapping = require('./mapping.json');
 const { getTorboxStream } = require('./torbox');
 
 const QAYADAT_BASE = 'https://play.qayadat.org';
+const QAYADAT_FALLBACK = 'https://qayadatplay.com';
 
 const HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -17,7 +18,6 @@ async function checkPixeldrainAvailable(url) {
             timeout: 5000,
             validateStatus: () => true
         });
-        // Pixeldrain returns 509 when bandwidth exceeded
         if (res.status === 509 || res.status === 429) {
             console.log('Pixeldrain bandwidth exceeded, using TorBox fallback');
             return false;
@@ -25,7 +25,7 @@ async function checkPixeldrainAvailable(url) {
         return true;
     } catch (e) {
         console.log('Pixeldrain check failed:', e.message);
-        return true; // Assume available if check fails
+        return true;
     }
 }
 
@@ -42,13 +42,80 @@ async function resolvePixeldrain(url) {
     }
 }
 
+function extractPixeldrainLinks($) {
+    const links = [];
+    $('a[href*="pixeldrain.com"]').each((i, el) => {
+        const href = $(el).attr('href');
+        const text = $(el).text().trim();
+
+        const match = href.match(/pixeldrain\.com\/u\/([a-zA-Z0-9]+)/);
+        if (match) {
+            const fileId = match[1];
+            const cleanTitle = text.replace('Download', '').trim();
+            const rawUrl = `https://pixeldrain.com/api/file/${fileId}`;
+            links.push({ fileId, cleanTitle, rawUrl });
+        }
+    });
+    return links;
+}
+
+// Get the show slug from the mapping URL
+function getShowSlug(seriesUrl) {
+    const parts = seriesUrl.replace(QAYADAT_BASE, '').split('/').filter(p => p);
+    let slug = parts[parts.length - 1];
+    slug = slug.replace('-urdu-subtitles', '');
+    return slug;
+}
+
+// Build streams from pixeldrain links
+async function buildStreams(pixeldrainLinks) {
+    if (pixeldrainLinks.length === 0) return [];
+
+    const pixeldrainAvailable = await checkPixeldrainAvailable(pixeldrainLinks[0].rawUrl);
+    const streams = [];
+
+    for (const link of pixeldrainLinks) {
+        if (pixeldrainAvailable) {
+            const resolvedUrl = await resolvePixeldrain(link.rawUrl);
+            streams.push({
+                title: `Qayadat Play\n${link.cleanTitle}`,
+                url: resolvedUrl,
+                behaviorHints: {
+                    notWebReady: true,
+                    bingeGroup: "qayadat"
+                }
+            });
+        } else {
+            const torboxUrl = await getTorboxStream(link.rawUrl);
+            if (torboxUrl) {
+                streams.push({
+                    title: `Qayadat Play (TorBox)\n${link.cleanTitle}`,
+                    url: torboxUrl,
+                    behaviorHints: {
+                        notWebReady: true,
+                        bingeGroup: "qayadat-torbox"
+                    }
+                });
+            } else {
+                streams.push({
+                    title: `Qayadat Play (Limited)\n${link.cleanTitle}`,
+                    url: link.rawUrl,
+                    behaviorHints: {
+                        notWebReady: true,
+                        bingeGroup: "qayadat"
+                    }
+                });
+            }
+        }
+    }
+    return streams;
+}
+
 async function getStream(type, id) {
-    // ID format: tt123456:1:1 (imdb_id:season:episode)
     let [imdbId, season, episode] = id.split(':');
     season = parseInt(season);
     episode = parseInt(episode);
 
-    // 1. Get Series URL from mapping
     let seriesEntry = mapping[imdbId];
     let seriesUrl = null;
     let seasonOffsets = null;
@@ -65,14 +132,15 @@ async function getStream(type, id) {
         return [];
     }
 
-    // Handle Absolute Numbering Mapping (e.g. S3 E14 -> Ep 63)
     let targetEpisode = episode;
     if (seasonOffsets && seasonOffsets[season]) {
         targetEpisode = episode + seasonOffsets[season];
         console.log(`Applied offset for Season ${season}: ${episode} -> Episode ${targetEpisode}`);
     }
 
-    // Loop through pages (max 5) to find the episode
+    const showSlug = getShowSlug(seriesUrl);
+
+    // === STRATEGY 1: Try primary site (play.qayadat.org) ===
     let episodeUrl = null;
     let currentPage = 1;
     const MAX_PAGES = 5;
@@ -117,90 +185,50 @@ async function getStream(type, id) {
         }
     }
 
-    if (!episodeUrl) {
-        console.log(`Episode link not found for Season ${season} Episode ${episode} (Target: ${targetEpisode})`);
-        return [];
+    // If we found the episode URL on primary site, try to get links from it
+    if (episodeUrl) {
+        if (!episodeUrl.startsWith('http')) {
+            episodeUrl = QAYADAT_BASE + episodeUrl;
+        }
+
+        console.log(`Fetching episode page: ${episodeUrl}`);
+        try {
+            const episodePage = await axios.get(episodeUrl, { headers: HEADERS });
+            const $ep = cheerio.load(episodePage.data);
+            const pixeldrainLinks = extractPixeldrainLinks($ep);
+
+            if (pixeldrainLinks.length > 0) {
+                console.log(`Found ${pixeldrainLinks.length} Pixeldrain links on primary site`);
+                return await buildStreams(pixeldrainLinks);
+            }
+            console.log("No Pixeldrain links on primary episode page");
+        } catch (e) {
+            console.log(`Primary episode page error: ${e.message}`);
+        }
+    } else {
+        console.log(`Episode ${targetEpisode} not found on primary site series pages`);
     }
 
-    // Fix relative URLs
-    if (!episodeUrl.startsWith('http')) {
-        episodeUrl = QAYADAT_BASE + episodeUrl;
-    }
+    // === STRATEGY 2: Try fallback site (qayadatplay.com) ===
+    const fallbackUrl = `${QAYADAT_FALLBACK}/${showSlug}-episode-${targetEpisode}-urdu-subtitles.html`;
+    console.log(`Trying fallback site: ${fallbackUrl}`);
 
-    console.log(`Fetching episode page: ${episodeUrl}`);
     try {
-        const episodePage = await axios.get(episodeUrl, { headers: HEADERS });
-        const $ep = cheerio.load(episodePage.data);
+        const fallbackPage = await axios.get(fallbackUrl, { headers: HEADERS });
+        const $fallback = cheerio.load(fallbackPage.data);
+        const pixeldrainLinks = extractPixeldrainLinks($fallback);
 
-        const streams = [];
-        const pixeldrainLinks = [];
-
-        // Collect all Pixeldrain links first
-        $ep('a[href*="pixeldrain.com"]').each((i, el) => {
-            const href = $ep(el).attr('href');
-            const text = $ep(el).text().trim();
-
-            const match = href.match(/pixeldrain\.com\/u\/([a-zA-Z0-9]+)/);
-            if (match) {
-                const fileId = match[1];
-                const cleanTitle = text.replace('Download', '').trim();
-                const rawUrl = `https://pixeldrain.com/api/file/${fileId}`;
-                pixeldrainLinks.push({ fileId, cleanTitle, rawUrl });
-            }
-        });
-
-        if (pixeldrainLinks.length === 0) {
-            console.log("No Pixeldrain links found on page.");
-            return [];
+        if (pixeldrainLinks.length > 0) {
+            console.log(`Found ${pixeldrainLinks.length} Pixeldrain links on fallback site!`);
+            return await buildStreams(pixeldrainLinks);
         }
-
-        // Check if Pixeldrain is available (first link as sample)
-        const pixeldrainAvailable = await checkPixeldrainAvailable(pixeldrainLinks[0].rawUrl);
-
-        for (const link of pixeldrainLinks) {
-            if (pixeldrainAvailable) {
-                // Use Pixeldrain directly
-                const resolvedUrl = await resolvePixeldrain(link.rawUrl);
-                streams.push({
-                    title: `Qayadat Play\n${link.cleanTitle}`,
-                    url: resolvedUrl,
-                    behaviorHints: {
-                        notWebReady: true,
-                        bingeGroup: "qayadat"
-                    }
-                });
-            } else {
-                // Fallback to TorBox
-                const torboxUrl = await getTorboxStream(link.rawUrl);
-                if (torboxUrl) {
-                    streams.push({
-                        title: `Qayadat Play (TorBox)\n${link.cleanTitle}`,
-                        url: torboxUrl,
-                        behaviorHints: {
-                            notWebReady: true,
-                            bingeGroup: "qayadat-torbox"
-                        }
-                    });
-                } else {
-                    // TorBox failed, still add Pixeldrain as last resort
-                    streams.push({
-                        title: `Qayadat Play (Limited)\n${link.cleanTitle}`,
-                        url: link.rawUrl,
-                        behaviorHints: {
-                            notWebReady: true,
-                            bingeGroup: "qayadat"
-                        }
-                    });
-                }
-            }
-        }
-
-        return streams;
-
-    } catch (e) {
-        console.error('Scraping error:', e.message);
-        return [];
+        console.log("No Pixeldrain links on fallback site either");
+    } catch (fallbackErr) {
+        console.log(`Fallback site error: ${fallbackErr.message}`);
     }
+
+    console.log("No streams found from any source");
+    return [];
 }
 
 module.exports = { getStream };
