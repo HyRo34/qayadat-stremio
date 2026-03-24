@@ -9,7 +9,7 @@ This addon scrapes Turkish shows from [Qayadat Play](https://play.qayadat.org) a
 ## Installation
 
 1.  **Start the Addon Server**:
-    Open a terminal in this directory (`c:\Users\Safee\OneDrive\Desktop\PROJECTS\turikishshowaddon`) and run:
+    Open a terminal and run:
     ```bash
     npm start
     ```
